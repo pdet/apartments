@@ -23,6 +23,12 @@ class Listing:
             return self.title
         return f"{self.title}, {self.city}"
 
+    @property
+    def rent_eur(self) -> int | None:
+        """Monthly rent in whole euros: "€ 1.207,- /mnd" -> 1207, "€ 1.583,00 / maand" -> 1583."""
+        match = re.search(r"€\s*(\d[\d.]*)", self.price or "")
+        return int(match.group(1).replace(".", "")) if match else None
+
 
 def first_int(text: str | None) -> int | None:
     match = re.search(r"\d+", text or "")

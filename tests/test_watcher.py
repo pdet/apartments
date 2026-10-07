@@ -1,11 +1,23 @@
 import pytest
 
+from apartment_watcher.applying import (
+    APPLIED,
+    CAP_REACHED,
+    FAILED,
+    ON,
+    SHADOW,
+    SKIPPED,
+    WOULD_APPLY,
+    ApplyResult,
+    LoginError,
+)
+from apartment_watcher.criteria import Criteria
 from apartment_watcher.listing import Listing
 from apartment_watcher.store import SeenStore
 from apartment_watcher.watcher import ALERT_AFTER_FAILURES, Source, Watcher, is_match
 
 
-def make_listing(listing_id, city="Amsterdam", status="Te huur", title=None):
+def make_listing(listing_id, city="Amsterdam", status="Te huur", title=None, price="€ 1.500,- /mnd", size_m2=60):
     return Listing(
         source="Test",
         listing_id=listing_id,
@@ -13,19 +25,23 @@ def make_listing(listing_id, city="Amsterdam", status="Te huur", title=None):
         title=title or f"Appartement Straat {listing_id}",
         city=city,
         status=status,
+        price=price,
+        size_m2=size_m2,
     )
 
 
 class FakeNotifier:
     def __init__(self):
         self.listings = []
+        self.applications = []
         self.alerts = []
         self.fail = False
 
-    def send_listing(self, listing):
+    def send_listing(self, listing, application=None):
         if self.fail:
             raise OSError("SMTP down")
         self.listings.append(listing)
+        self.applications.append(application)
 
     def send_alert(self, subject, body):
         self.alerts.append(subject)
@@ -148,3 +164,115 @@ def test_empty_results_count_as_failure(setup):
     for _ in range(ALERT_AFTER_FAILURES):
         watcher.run_once()
     assert notifier.alerts == ["Test scraper may be broken"]
+
+
+class FakeApplicant:
+    def __init__(self):
+        self.applied = []
+        self.logins = 0
+        self.login_error = None
+        self.apply_error = None
+
+    def login(self):
+        self.logins += 1
+        if self.login_error:
+            raise self.login_error
+
+    def apply(self, listing):
+        if self.apply_error:
+            raise self.apply_error
+        self.applied.append(listing.listing_id)
+        return ApplyResult(APPLIED)
+
+
+@pytest.fixture
+def apply_setup():
+    store = SeenStore(":memory:")
+    notifier = FakeNotifier()
+    source = FakeSource()
+    applicant = FakeApplicant()
+    watcher = Watcher(
+        store,
+        notifier,
+        sources=[Source("Test", source.fetch)],
+        applicants={"Test": applicant},
+        criteria=Criteria(max_rent=1600, min_size_m2=50),
+        apply_mode=ON,
+        max_applications_per_day=2,
+    )
+    source.listings = [make_listing("seed")]
+    watcher.run_once()
+    yield watcher, notifier, source, applicant, store
+    store.close()
+
+
+def test_applies_to_new_listing_that_fits(apply_setup):
+    watcher, notifier, source, applicant, store = apply_setup
+    fits, too_expensive = make_listing("1"), make_listing("2", price="€ 2.000,- /mnd")
+    source.listings = [fits, too_expensive]
+    watcher.run_once()
+
+    assert applicant.applied == ["1"]
+    assert [a.status for a in notifier.applications] == [APPLIED, SKIPPED]
+    assert "rent € 2.000 > max € 1.600" in notifier.applications[1].detail
+    assert store.application_status(fits) == APPLIED
+    assert store.application_status(too_expensive) is None
+
+
+def test_shadow_mode_never_submits(apply_setup):
+    watcher, notifier, source, applicant, store = apply_setup
+    watcher.apply_mode = SHADOW
+    source.listings = [make_listing("1")]
+    watcher.run_once()
+
+    assert applicant.applied == [] and applicant.logins == 0
+    assert notifier.applications[0].status == WOULD_APPLY
+
+
+def test_mode_off_or_other_source_has_no_application(apply_setup):
+    watcher, notifier, source, applicant, store = apply_setup
+    watcher.applicants = {}
+    source.listings = [make_listing("1")]
+    watcher.run_once()
+    assert notifier.applications == [None]
+
+
+def test_daily_cap(apply_setup):
+    watcher, notifier, source, applicant, store = apply_setup
+    source.listings = [make_listing(str(i)) for i in range(3)]
+    watcher.run_once()
+
+    assert applicant.applied == ["0", "1"]
+    assert notifier.applications[2].status == CAP_REACHED
+
+
+def test_apply_error_is_recorded_and_still_emailed(apply_setup):
+    watcher, notifier, source, applicant, store = apply_setup
+    applicant.apply_error = RuntimeError("form changed")
+    listing = make_listing("1")
+    source.listings = [listing]
+    watcher.run_once()
+
+    assert notifier.applications[0].status == FAILED
+    assert store.application_status(listing) == FAILED
+
+
+def test_login_failure_alerts_after_repeated_failures(apply_setup):
+    watcher, notifier, source, applicant, store = apply_setup
+    applicant.login_error = LoginError("bad password")
+    for i in range(ALERT_AFTER_FAILURES):
+        source.listings = [make_listing(f"new{i}"), make_listing(f"other{i}")]
+        watcher.run_once()
+
+    assert applicant.logins == ALERT_AFTER_FAILURES  # once per check, not once per listing
+    assert notifier.alerts == ["Test auto-apply login failing"]
+    assert all(a.status == FAILED for a in notifier.applications)
+
+
+def test_apply_existing_applies_once_to_listings_seen_before(apply_setup):
+    watcher, notifier, source, applicant, store = apply_setup
+    watcher.run_once(apply_existing=True)
+    watcher.run_once(apply_existing=True)
+
+    assert applicant.applied == ["seed"]
+    assert len(notifier.listings) == 1

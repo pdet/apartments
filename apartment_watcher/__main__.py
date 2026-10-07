@@ -4,6 +4,10 @@ import os
 
 from dotenv import load_dotenv
 
+from . import mvgm
+from .applying import MODES, OFF, ON
+from .criteria import Criteria
+from .mvgm_apply import MvgmApplicant
 from .notify import EmailNotifier
 from .store import SeenStore
 from .watcher import Watcher, run_forever
@@ -22,21 +26,50 @@ def main(argv: list[str] | None = None) -> None:
         "--dry-run", action="store_true", help="print matching listings; don't send email or update the database"
     )
     parser.add_argument(
+        "--apply-existing", action="store_true", help="run one check that also applies to listings seen before"
+    )
+    parser.add_argument("--check-login", action="store_true", help="log in to MVGM with the .env credentials and exit")
+    parser.add_argument("--test-email", action="store_true", help="send a test email and exit")
+    parser.add_argument(
         "--interval",
         type=float,
         default=float(os.environ.get("POLL_INTERVAL_MINUTES", 10)),
         help="minutes between checks (default: %(default)s)",
     )
-    parser.add_argument("--db", default="data/seen.db", help="SQLite file with seen listings (default: %(default)s)")
+    parser.add_argument("--db", default="data/apartments.duckdb", help="DuckDB file (default: %(default)s)")
     args = parser.parse_args(argv)
-
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    applicant = MvgmApplicant(os.environ.get("MVGM_EMAIL", ""), os.environ.get("MVGM_PASSWORD", ""))
+    if args.check_login:
+        applicant.login()
+        log.info("MVGM login OK")
+        return
+    if args.test_email:
+        EmailNotifier.from_env().send_test()
+        log.info("Test email sent")
+        return
+
+    mode = os.environ.get("AUTO_APPLY", OFF).strip().lower() or OFF
+    if mode not in MODES:
+        raise SystemExit(f"AUTO_APPLY must be one of {', '.join(MODES)}")
+    if mode == ON:
+        raise SystemExit("AUTO_APPLY=on isn't available yet; use AUTO_APPLY=shadow for now.")
+
     notifier = None if args.dry_run else EmailNotifier.from_env()
     store = SeenStore(args.db)
-    watcher = Watcher(store, notifier, dry_run=args.dry_run)
+    watcher = Watcher(
+        store,
+        notifier,
+        dry_run=args.dry_run,
+        applicants={} if mode == OFF else {mvgm.SOURCE: applicant},
+        criteria=Criteria.from_env(),
+        apply_mode=mode,
+        max_applications_per_day=int(os.environ.get("MAX_APPLICATIONS_PER_DAY") or 5),
+    )
     try:
-        if args.once:
-            watcher.run_once()
+        if args.once or args.apply_existing:
+            watcher.run_once(apply_existing=args.apply_existing)
         else:
             run_forever(watcher, args.interval)
     except KeyboardInterrupt:

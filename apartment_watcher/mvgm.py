@@ -5,8 +5,7 @@ site's address autocomplete, POST the search form once, and then page through
 /aanbod/?page=N with the same session cookie.
 
 The session cookie is only created by the first AJAX call, so the CSRF token on the very
-first page load belongs to a session that is never persisted. We therefore reload
-/aanbod/ after the lookup to get a token that matches our session.
+first page load belongs to a session that is never persisted; open_session() handles that.
 """
 
 from __future__ import annotations
@@ -16,6 +15,7 @@ import re
 import time
 from urllib.parse import urljoin
 
+import requests
 from bs4 import BeautifulSoup, Tag
 
 from .listing import Listing, first_int
@@ -89,38 +89,44 @@ def parse_csrf_token(html: str) -> str:
     return token["value"]
 
 
-def fetch_listings() -> list[Listing]:
+def open_session() -> tuple[requests.Session, str]:
+    """Return a session whose cookie is persisted by the site, plus its CSRF token."""
     session = new_session()
-
     response = session.get(SEARCH_URL, timeout=TIMEOUT)
     response.raise_for_status()
-    ajax_headers = {"X-CSRF-TOKEN": parse_csrf_token(response.text), "X-Requested-With": "XMLHttpRequest"}
+    # The cookie is only created by an AJAX call; the address lookup is a cheap one.
+    _lookup_location(session, parse_csrf_token(response.text))
+    response = session.get(SEARCH_URL, timeout=TIMEOUT)
+    response.raise_for_status()
+    return session, parse_csrf_token(response.text)
 
-    # Resolve Amsterdam through the address autocomplete, like the site's search box does.
+
+def _lookup_location(session: requests.Session, token: str) -> str:
+    """Resolve Amsterdam through the address autocomplete, like the site's search box does."""
     response = session.post(
         f"{BASE_URL}/aanbod/geo/adressen/",
         data={"q": CITY_QUERY, "typefilter": "(gemeente OR woonplaats)", "page": 1},
-        headers=ajax_headers,
+        headers=_ajax_headers(token),
         timeout=TIMEOUT,
     )
     response.raise_for_status()
-    location_id = next(
-        (r["id"] for r in response.json().get("results", []) if r.get("text") == CITY_LABEL),
-        None,
-    )
+    location_id = next((r["id"] for r in response.json().get("results", []) if r.get("text") == CITY_LABEL), None)
     if location_id is None:
         raise RuntimeError(f"MVGM: location {CITY_LABEL!r} not found in address lookup")
+    return location_id
 
-    # Now that the session cookie exists, fetch a CSRF token that belongs to it.
-    response = session.get(SEARCH_URL, timeout=TIMEOUT)
-    response.raise_for_status()
-    token = parse_csrf_token(response.text)
-    ajax_headers["X-CSRF-TOKEN"] = token
 
+def _ajax_headers(token: str) -> dict[str, str]:
+    return {"X-CSRF-TOKEN": token, "X-Requested-With": "XMLHttpRequest"}
+
+
+def fetch_listings() -> list[Listing]:
+    session, token = open_session()
+    location_id = _lookup_location(session, token)
     response = session.post(
         f"{BASE_URL}/aanbod/geo/adres/",
         data={"locatieid": location_id},
-        headers=ajax_headers,
+        headers=_ajax_headers(token),
         timeout=TIMEOUT,
     )
     response.raise_for_status()
