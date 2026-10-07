@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from urllib.parse import urljoin
 
@@ -15,6 +16,7 @@ BASE_URL = "https://www.vestim.nl"
 # The Amsterdam office includes nearby towns; the watcher filters by city afterwards.
 SEARCH_URL = f"{BASE_URL}/woningen?status=for_rent&kantoor=amsterdam"
 MAX_PAGES = 20
+_TOTAL_RE = re.compile(r"(\d+)\s+woning(?:en)?\b")  # e.g. "10 woningen"
 
 
 def parse_page(html: str) -> tuple[list[Listing], str | None]:
@@ -25,7 +27,7 @@ def parse_page(html: str) -> tuple[list[Listing], str | None]:
         url = urljoin(BASE_URL, card["href"])
         # Titles look like "Amsterdam, Jacob van Lennepkade".
         title = _text(card.select_one(".vm-listing-title"))
-        city = title.partition(",")[0].strip()
+        city = title.partition(",")[0].strip() if "," in title else ""
         # The label is either an availability date ("Per 12 Oktober 2026") or a tagline ("Ruim appartement").
         label = _text(card.select_one(".vm-listing-label"))
         listings.append(
@@ -47,18 +49,33 @@ def parse_page(html: str) -> tuple[list[Listing], str | None]:
     return listings, next_url
 
 
+def parse_total(html: str) -> int:
+    """Number of results the page says it has; raises if the counter is gone."""
+    match = _TOTAL_RE.search(_text(BeautifulSoup(html, "html.parser").select_one(".listing-tools-wrap")))
+    if match is None:
+        raise RuntimeError("Vestim: result count not found; the page layout may have changed")
+    return int(match.group(1))
+
+
 def fetch_listings() -> list[Listing]:
     with new_session() as session:
         listings: list[Listing] = []
         url: str | None = SEARCH_URL
         visited: set[str] = set()
-        while url and url not in visited and len(visited) < MAX_PAGES:
+        while url:
+            if url in visited:
+                raise RuntimeError("Vestim: pagination repeated a page before reaching the end")
+            if len(visited) >= MAX_PAGES:
+                raise RuntimeError(f"Vestim: pagination exceeds the limit of {MAX_PAGES} pages")
             if visited:
                 time.sleep(PAGE_DELAY)
             visited.add(url)
             response = session.get(url, timeout=TIMEOUT)
             response.raise_for_status()
+            total = parse_total(response.text)
             page_listings, url = parse_page(response.text)
+            if total and not page_listings:
+                raise RuntimeError(f"Vestim: the site lists {total} homes but none could be read")
             listings.extend(page_listings)
         return listings
 

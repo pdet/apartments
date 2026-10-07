@@ -1,3 +1,7 @@
+import subprocess
+import sys
+from dataclasses import replace
+
 import pytest
 
 from apartment_watcher.applying import (
@@ -14,7 +18,8 @@ from apartment_watcher.applying import (
 from apartment_watcher.criteria import Criteria
 from apartment_watcher.listing import Listing
 from apartment_watcher.store import SeenStore
-from apartment_watcher.watcher import ALERT_AFTER_FAILURES, Source, Watcher, is_match
+from apartment_watcher import watcher as watcher_module
+from apartment_watcher.watcher import ALERT_AFTER_FAILURES, QUIET_ALERT_AFTER, Source, Watcher, is_match
 
 
 def make_listing(listing_id, city="Amsterdam", status="Te huur", title=None, price="€ 1.500,- /mnd", size_m2=60):
@@ -44,6 +49,8 @@ class FakeNotifier:
         self.applications.append(application)
 
     def send_alert(self, subject, body):
+        if self.fail:
+            raise OSError("SMTP down")
         self.alerts.append(subject)
 
 
@@ -159,17 +166,61 @@ def test_alert_sent_once_after_consecutive_failures(setup):
     assert len(notifier.alerts) == 2
 
 
-def test_empty_results_count_as_failure(setup):
+def test_no_amsterdam_rentals_alerts_only_after_a_day(setup):
     watcher, notifier, source = setup
+    source.listings = [make_listing("1", city="Amstelveen")]
+    for _ in range(QUIET_ALERT_AFTER - 1):
+        watcher.run_once()
+    assert notifier.alerts == []
+
+    watcher.run_once()
+    assert notifier.alerts == ["No Test rentals in Amsterdam for a day"]
+
+
+def test_unreadable_listings_count_as_failure(setup):
+    watcher, notifier, source = setup
+    source.listings = [make_listing("1", city=""), make_listing("2", status="")]
     for _ in range(ALERT_AFTER_FAILURES):
         watcher.run_once()
     assert notifier.alerts == ["Test scraper may be broken"]
+
+
+def test_failing_email_falls_back_to_desktop_notification(setup, monkeypatch):
+    watcher, notifier, source = setup
+    desktop = []
+    monkeypatch.setattr(watcher_module, "notify_desktop", desktop.append)
+    source.listings = [make_listing("seed")]
+    watcher.run_once()
+
+    notifier.fail = True
+    source.listings = [make_listing(str(i)) for i in range(ALERT_AFTER_FAILURES)]
+    watcher.run_once()
+    assert len(desktop) == 1 and desktop[0].startswith("Emails are failing")
+
+    notifier.fail = False
+    watcher.run_once()
+    assert watcher.failures["email"] == 0 and len(notifier.listings) == ALERT_AFTER_FAILURES
+
+
+def test_hanging_check_is_killed_by_the_watchdog():
+    code = (
+        "import time\n"
+        "from apartment_watcher import watcher\n"
+        "watcher.CHECK_TIMEOUT_SECONDS = 1\n"
+        "class Hangs:\n"
+        "    def run_once(self): time.sleep(30)\n"
+        "watcher.run_forever(Hangs(), 10)\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], timeout=20)
+    assert result.returncode == -14  # SIGALRM
 
 
 def test_failed_alert_is_retried_until_delivered(setup, monkeypatch):
     watcher, notifier, source = setup
     source.error = RuntimeError("layout changed")
     send_alert = notifier.send_alert
+    desktop = []
+    monkeypatch.setattr(watcher_module, "notify_desktop", desktop.append)
 
     def fail_alert(*args):
         raise OSError("SMTP down")
@@ -177,10 +228,59 @@ def test_failed_alert_is_retried_until_delivered(setup, monkeypatch):
     monkeypatch.setattr(notifier, "send_alert", fail_alert)
     for _ in range(ALERT_AFTER_FAILURES + 1):
         watcher.run_once()
+    assert len(desktop) == 1
+    assert "email settings" in desktop[0]
     monkeypatch.setattr(notifier, "send_alert", send_alert)
     watcher.run_once()
     watcher.run_once()
     assert notifier.alerts == ["Test scraper may be broken"]
+
+
+def test_processing_failure_alerts_and_does_not_block_other_sources(setup, monkeypatch):
+    watcher, notifier, source = setup
+    source.listings = [make_listing("1")]
+    other = replace(make_listing("2"), source="Other")
+    watcher.sources.append(Source("Other", lambda: [other]))
+    watcher.store.mark_seeded("Other")
+    is_seeded = watcher.store.is_seeded
+
+    def fail_first_source(name):
+        if name == "Test":
+            raise OSError("database unavailable")
+        return is_seeded(name)
+
+    monkeypatch.setattr(watcher.store, "is_seeded", fail_first_source)
+    for _ in range(ALERT_AFTER_FAILURES + 1):
+        watcher.run_once()
+    assert notifier.listings == [other]
+    assert notifier.alerts == ["Test scraper may be broken"]
+
+    monkeypatch.setattr(watcher.store, "is_seeded", is_seeded)
+    watcher.run_once()
+    monkeypatch.setattr(watcher.store, "is_seeded", fail_first_source)
+    for _ in range(ALERT_AFTER_FAILURES):
+        watcher.run_once()
+    assert notifier.alerts == ["Test scraper may be broken", "Test scraper may be broken"]
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_watchdog_is_disarmed_before_sleep(monkeypatch, fails):
+    alarms = []
+    monkeypatch.setattr(watcher_module.signal, "alarm", alarms.append)
+
+    class Check:
+        def run_once(self):
+            assert alarms == [watcher_module.CHECK_TIMEOUT_SECONDS]
+            if fails:
+                raise RuntimeError("check failed")
+
+    def stop_sleep(delay):
+        assert alarms == [watcher_module.CHECK_TIMEOUT_SECONDS, 0]
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(watcher_module.time, "sleep", stop_sleep)
+    with pytest.raises(KeyboardInterrupt):
+        watcher_module.run_forever(Check(), 10)
 
 
 class FakeApplicant:

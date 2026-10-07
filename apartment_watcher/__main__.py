@@ -10,7 +10,7 @@ from . import mvgm
 from .applying import MODES, OFF, ON
 from .criteria import Criteria
 from .mvgm_apply import MvgmApplicant
-from .notify import EmailNotifier
+from .notify import EmailNotifier, notify_desktop
 from .store import SeenStore
 from .watcher import Watcher, run_forever
 
@@ -95,4 +95,12 @@ def main(argv: list[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit as exc:
+        if exc.code not in (0, None):
+            notify_desktop(f"Apartment watcher stopped: {exc.code if isinstance(exc.code, str) else 'a setting is wrong, run Install again'}")
+        raise
+    except Exception as exc:
+        notify_desktop(f"Apartment watcher stopped: {exc}")
+        raise

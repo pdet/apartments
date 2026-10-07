@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import html
+import json
 import os
 import smtplib
+import subprocess
 import ssl
 from email.message import EmailMessage
 
@@ -99,3 +101,12 @@ def listing_bodies(listing: Listing, application: ApplyResult | None = None) -> 
         f'<p><a href="{html.escape(listing.url)}">{html.escape(listing.url)}</a></p>'
     )
     return text, html_body
+
+
+def notify_desktop(message: str) -> None:
+    """Show a macOS notification, the fallback when email isn't working; never raises."""
+    text = json.dumps(" ".join(message.split()), ensure_ascii=False)
+    try:
+        subprocess.run(["osascript", "-e", f'display notification {text} with title "Apartment watcher"'], timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass

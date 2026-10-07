@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import random
+import signal
 import time
 import traceback
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from .applying import (
 )
 from .criteria import Criteria
 from .listing import Listing
+from .notify import notify_desktop
 from .store import SeenStore
 
 log = logging.getLogger(__name__)
@@ -29,7 +31,9 @@ log = logging.getLogger(__name__)
 TARGET_CITY = "Amsterdam"
 RENTABLE_STATUS = "Te huur"
 NON_DWELLING_TYPES = {"parkeerplaats", "garage", "garagebox", "berging"}
-ALERT_AFTER_FAILURES = 6  # consecutive failures (scraping or login) before emailing an alert
+ALERT_AFTER_FAILURES = 6  # consecutive failures (scraping, login or email) before alerting
+QUIET_ALERT_AFTER = 144  # checks without any Amsterdam rental (about a day) before alerting
+CHECK_TIMEOUT_SECONDS = 15 * 60  # a check normally takes about a minute
 
 
 class Notifier(Protocol):
@@ -86,23 +90,41 @@ class Watcher:
         """Check every source. With apply_existing, also apply to matching listings seen before."""
         self._logged_in.clear()
         for source in self.sources:
-            self._check(source, apply_existing)
+            try:
+                self._check(source, apply_existing)
+            except Exception:
+                log.exception("%s: check failed", source.name)
+                self._record_failure(
+                    source.name,
+                    f"{source.name} scraper may be broken",
+                    f"Checking {source.name} failed. You won't get emails for new {source.name} listings until this is fixed.",
+                    traceback.format_exc(),
+                )
+            else:
+                self._reset_failures(source.name)
 
     def _check(self, source: Source, apply_existing: bool) -> None:
-        try:
-            listings = source.fetch()
-        except Exception:
-            log.exception("%s: scraping failed", source.name)
-            self._record_scrape_failure(source, traceback.format_exc())
-            return
-        if not listings:
-            self._record_scrape_failure(source, "The scraper returned no listings at all; the site layout may have changed.")
-            return
-        self.failures[source.name] = 0
-        self._alerted.discard(source.name)
+        listings = source.fetch()
+        unreadable = sum(1 for listing in listings if not listing.city or not listing.status)
+        if unreadable * 2 > len(listings):
+            raise RuntimeError(
+                f"Could not read the city or status of {unreadable} of {len(listings)} listings; the site layout may have changed."
+            )
 
         matches = [listing for listing in listings if is_match(listing)]
         log.info("%s: %d listings scraped, %d for rent in %s", source.name, len(listings), len(matches), TARGET_CITY)
+        quiet_key = f"{source.name} quiet"
+        if matches:
+            self._reset_failures(quiet_key)
+        else:
+            self._record_failure(
+                quiet_key,
+                f"No {source.name} rentals in {TARGET_CITY} for a day",
+                f"{source.name} has shown no rentals in {TARGET_CITY} for about a day. That can be normal, "
+                "but the website may also have changed.",
+                f"{len(listings)} listings found, none for rent in {TARGET_CITY}.",
+                alert_after=QUIET_ALERT_AFTER,
+            )
 
         if self.dry_run:
             for listing in matches:
@@ -130,10 +152,7 @@ class Watcher:
 
     def _handle_new(self, listing: Listing) -> None:
         application = self._maybe_apply(listing)
-        try:
-            self.notifier.send_listing(listing, application)
-        except Exception:
-            log.exception("%s: failed to email %s; will retry next check", listing.source, listing.url)
+        if not self._send_listing(listing, application):
             return
         self.store.mark_seen(listing)
         log.info("%s: emailed new listing %s (%s)", listing.source, listing.display_name, listing.url)
@@ -145,10 +164,22 @@ class Watcher:
             return
         log.info("%s: %s -> %s %s", listing.source, listing.display_name, application.status, application.detail)
         if application.status in (APPLIED, FAILED):
-            try:
-                self.notifier.send_listing(listing, application)
-            except Exception:
-                log.exception("%s: failed to email the application result for %s", listing.source, listing.url)
+            self._send_listing(listing, application)
+
+    def _send_listing(self, listing: Listing, application: ApplyResult | None) -> bool:
+        try:
+            self.notifier.send_listing(listing, application)
+        except Exception:
+            log.exception("%s: failed to email %s; will retry next check", listing.source, listing.url)
+            self._record_failure(
+                "email",
+                "Emails are failing",
+                "Sending apartment emails failed. Run Install again to check the Gmail settings.",
+                traceback.format_exc(),
+            )
+            return False
+        self._reset_failures("email")
+        return True
 
     def _maybe_apply(self, listing: Listing) -> ApplyResult | None:
         """Apply to the listing if auto-apply is on and it fits the criteria; None if auto-apply doesn't cover it."""
@@ -192,27 +223,26 @@ class Watcher:
                 )
             else:
                 self._logged_in[source] = True
-                self.failures[key] = 0
-                self._alerted.discard(key)
+                self._reset_failures(key)
         return self._logged_in[source]
 
-    def _record_scrape_failure(self, source: Source, reason: str) -> None:
-        self._record_failure(
-            source.name,
-            f"{source.name} scraper may be broken",
-            f"Checking {source.name} failed. You won't get emails for new {source.name} listings until this is fixed.",
-            reason,
-        )
+    def _reset_failures(self, key: str) -> None:
+        self.failures[key] = 0
+        self._alerted.discard(key)
 
-    def _record_failure(self, key: str, subject: str, problem: str, reason: str) -> None:
+    def _record_failure(
+        self, key: str, subject: str, problem: str, reason: str, alert_after: int = ALERT_AFTER_FAILURES
+    ) -> None:
         count = self.failures[key] = self.failures.get(key, 0) + 1
         log.warning("%s: failed (%d in a row)", key, count)
-        if count < ALERT_AFTER_FAILURES or key in self._alerted or self.dry_run:
+        if count < alert_after or key in self._alerted or self.dry_run:
             return
         try:
             self.notifier.send_alert(subject, f"{problem}\n\nThis failed {count} times in a row. Last error:\n{reason}")
         except Exception:
-            log.exception("Failed to send the alert email")
+            log.exception("Failed to send the alert email; will retry next check")
+            if count == alert_after:
+                notify_desktop(f"{subject}. {problem} Alert email also failed; run Install.command to check email settings.")
         else:
             self._alerted.add(key)
 
@@ -221,10 +251,14 @@ def run_forever(watcher: Watcher, interval_minutes: float) -> None:
     if not math.isfinite(interval_minutes) or interval_minutes <= 0:
         raise ValueError("The polling interval must be a positive, finite number of minutes")
     while True:
+        # If a check hangs, SIGALRM's default action kills the process and launchd restarts it.
+        signal.alarm(CHECK_TIMEOUT_SECONDS)
         try:
             watcher.run_once()
         except Exception:
             log.exception("Unexpected error during check; continuing")
+        finally:
+            signal.alarm(0)
         delay = interval_minutes * 60 + random.uniform(0, 60)
         log.info("Next check in %.0f seconds", delay)
         time.sleep(delay)

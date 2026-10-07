@@ -12,10 +12,24 @@ def make_listing(price="€ 1.500,- /mnd", size_m2=60):
 
 @pytest.mark.parametrize(
     ("price", "rent"),
-    [("€ 1.207,- /mnd", 1207), ("€ 1.583,00 / maand", 1583), ("€ 976,00 / maand", 976), (None, None)],
+    [
+        ("€ 1.207,- /mnd", 1207),
+        ("€ 1.583,00 / maand", 1583),
+        ("€ 976,00 / maand", 976),
+        ("€ 1500", 1500),
+        ("€\u00a01.500,50 / maand", Decimal("1500.50")),
+        (None, None),
+    ],
 )
 def test_rent_eur(price, rent):
     assert make_listing(price=price).rent_eur == rent
+
+
+@pytest.mark.parametrize("price", ["€ 1.500,5", "€ 1,500.00", "€ 1..500", "€ 1 500", "€ 1.500,500"])
+def test_malformed_price_is_unknown_instead_of_partially_parsed(price):
+    listing = make_listing(price=price)
+    assert listing.rent_eur is None
+    assert Criteria(max_rent=1500, gross_yearly_income=67500).failures(listing) == ["rent unknown"]
 
 
 def test_no_criteria_fits_everything():

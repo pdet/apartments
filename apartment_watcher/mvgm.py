@@ -24,7 +24,8 @@ MAX_PAGES = 100
 
 _ID_RE = re.compile(r"-([0-9a-f]{32})/?$")
 # e.g. "1018PN Amsterdam - 2Km." or "2405VV Alphen aan den Rijn - 30Km."
-_LOCATION_RE = re.compile(r"^(?:\d{4}\s?[A-Z]{2}\s+)?(.+?)(?:\s+-\s+[\d.,]+\s*km\.?)?$", re.IGNORECASE)
+_LOCATION_RE = re.compile(r"^\d{4}\s?[A-Z]{2}\s+(.+?)(?:\s+-\s+[\d.,]+\s*km\.?)?$", re.IGNORECASE)
+_TOTAL_RE = re.compile(r"(\d+)\s*</span>\s*huurwoning(?:en)?\s+gevonden")  # e.g. "243 huurwoningen gevonden"
 _PAGE_RE = re.compile(r"[?&]page=(\d+)")
 # Cards only show a distance ("- 2Km.") when a location search is active.
 _DISTANCE_RE = re.compile(r"\s-\s[\d.,]+\s*Km\.")
@@ -65,8 +66,17 @@ def parse_page(html: str) -> tuple[list[Listing], int]:
 
 
 def parse_city(location: str) -> str:
+    """City from "1018PN Amsterdam - 2Km."; empty if the text has an unexpected format."""
     match = _LOCATION_RE.match(location.strip())
-    return match.group(1).strip() if match else location.strip()
+    return match.group(1).strip() if match else ""
+
+
+def parse_total(html: str) -> int:
+    """Number of results the page says it has; raises if the counter is gone."""
+    match = _TOTAL_RE.search(html)
+    if match is None:
+        raise RuntimeError("MVGM: result count not found; the page layout may have changed")
+    return int(match.group(1))
 
 
 def search_applied(html: str) -> bool:
@@ -139,15 +149,23 @@ def fetch_listings() -> list[Listing]:
             timeout=TIMEOUT,
         )
         response.raise_for_status()
+        total = parse_total(response.text)
         listings, last_page = parse_page(response.text)
+        if total and not listings:
+            raise RuntimeError(f"MVGM: the site lists {total} homes but none could be read")
         if listings and not search_applied(response.text):
             raise RuntimeError("MVGM: the Amsterdam search filter was not applied (got the unfiltered list)")
+        if last_page > MAX_PAGES:
+            raise RuntimeError(f"MVGM: pagination exceeds the limit of {MAX_PAGES} pages")
 
-        for page in range(2, min(last_page, MAX_PAGES) + 1):
+        for page in range(2, last_page + 1):
             time.sleep(PAGE_DELAY)
             response = session.get(SEARCH_URL, params={"page": page}, timeout=TIMEOUT)
             response.raise_for_status()
+            total = parse_total(response.text)
             page_listings, _ = parse_page(response.text)
+            if total and not page_listings:
+                raise RuntimeError(f"MVGM: the site lists {total} homes but none could be read on page {page}")
             if not page_listings:
                 break
             if not search_applied(response.text):

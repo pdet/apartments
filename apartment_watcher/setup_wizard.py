@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import getpass
+import math
 import os
 import plistlib
 import subprocess
@@ -69,12 +70,46 @@ def start_service() -> None:
         "WorkingDirectory": str(PROJECT_DIR),
         "RunAtLoad": True,
         "KeepAlive": True,
+        # Restart at most every 5 minutes so a broken setting can't hammer the websites.
+        "ThrottleInterval": 300,
         "StandardOutPath": log_file,
         "StandardErrorPath": log_file,
     }
     PLIST.parent.mkdir(parents=True, exist_ok=True)
     PLIST.write_bytes(plistlib.dumps(plist))
     subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(PLIST)], check=True)
+
+
+def repair_numeric_settings(env: dict[str, str]) -> None:
+    limits = [
+        ("MAX_RENT", "Maximum rent per month in euros", 0, False),
+        ("MIN_SIZE_M2", "Minimum size in m²", 0, False),
+        ("GROSS_YEARLY_INCOME", "Gross yearly income in euros", 0, False),
+        ("HOUSEHOLD_SIZE", "How many people will live there", 1, True),
+        ("MAX_APPLICATIONS_PER_DAY", "Maximum applications per day", 1, True),
+    ]
+    for name, question, minimum, required in limits:
+        value = env.get(name, "").strip()
+        if not value:
+            env[name] = ""
+            continue
+        try:
+            valid = int(value) >= minimum
+        except ValueError:
+            valid = False
+        if not valid:
+            print(f"  The saved {name} setting is invalid; please correct it.")
+            env[name] = ask(question, required=required, number=True, minimum=minimum)
+
+    while True:
+        try:
+            interval = float(env["POLL_INTERVAL_MINUTES"])
+            if math.isfinite(interval) and interval > 0:
+                break
+        except ValueError:
+            pass
+        print("  The saved polling interval must be a positive number of minutes.")
+        env["POLL_INTERVAL_MINUTES"] = ask("Minutes between checks", "10")
 
 
 def main() -> None:
@@ -88,7 +123,7 @@ def main() -> None:
     while True:
         env["GMAIL_ADDRESS"] = ask("Your Gmail address", current.get("GMAIL_ADDRESS"))
         env["GMAIL_APP_PASSWORD"] = ask("Gmail App Password", current.get("GMAIL_APP_PASSWORD"), secret=True).replace(" ", "")
-        env["EMAIL_TO"] = ask("Send apartment emails to", current.get("EMAIL_TO") or env["GMAIL_ADDRESS"])
+        env["EMAIL_TO"] = ask("Which email address should receive the apartment emails", current.get("EMAIL_TO") or env["GMAIL_ADDRESS"])
         try:
             EmailNotifier(env["GMAIL_ADDRESS"], env["GMAIL_APP_PASSWORD"], env["EMAIL_TO"]).send_test()
             print("  ✓ Test email sent. Check your inbox.\n")
@@ -125,6 +160,7 @@ def main() -> None:
     else:
         env["AUTO_APPLY"] = "off"
     env["POLL_INTERVAL_MINUTES"] = current.get("POLL_INTERVAL_MINUTES") or "10"
+    repair_numeric_settings(env)
     stop_service()
     write_env(env)
 

@@ -42,7 +42,7 @@ def test_parse_search_results_page():
         ("1187AB Amstelveen - 7Km.", "Amstelveen"),
         ("1115AB Amsterdam-Duivendrecht - 5Km.", "Amsterdam-Duivendrecht"),
         ("2405VV Alphen aan den Rijn - 30Km.", "Alphen aan den Rijn"),
-        ("Amsterdam", "Amsterdam"),
+        ("Amsterdam", ""),  # no postcode: unexpected format
     ],
 )
 def test_parse_city(location, city):
@@ -140,3 +140,56 @@ def test_live_apply_stays_unimplemented():
     applicant = mvgm_apply.MvgmApplicant("account@example.com", "password")
     with pytest.raises(NotImplementedError):
         applicant.apply(None)
+
+
+def test_parse_total():
+    assert mvgm.parse_total(PAGE) == 243
+    assert mvgm.parse_total("<span>0</span> huurwoningen gevonden") == 0
+    with pytest.raises(RuntimeError):
+        mvgm.parse_total("<html>redesigned</html>")
+
+
+def search_session(monkeypatch, first_page, later_page=""):
+    session = MagicMock()
+    session.post.side_effect = [
+        response(data={"results": [{"id": "city", "text": mvgm.CITY_LABEL}]}),
+        response(data={"lat": 52, "lng": 4}),
+        response(first_page),
+    ]
+    session.get.return_value = response(later_page)
+    monkeypatch.setattr(mvgm, "open_session", lambda: (session, "token"))
+    monkeypatch.setattr(mvgm.time, "sleep", lambda seconds: None)
+    return session
+
+
+@pytest.mark.parametrize("later_page", [False, True])
+@pytest.mark.parametrize(
+    ("html", "error"),
+    [
+        ("<html>redesigned</html>", "result count not found"),
+        ("<span>3</span> huurwoningen gevonden", "none could be read"),
+    ],
+)
+def test_fetch_rejects_unreadable_pages(monkeypatch, later_page, html, error):
+    session = search_session(monkeypatch, PAGE if later_page else html, html)
+    with pytest.raises(RuntimeError, match=error):
+        mvgm.fetch_listings()
+    assert session.get.call_count == int(later_page)
+    session.__exit__.assert_called_once()
+
+
+@pytest.mark.parametrize("later_page", [False, True])
+def test_fetch_accepts_verified_empty_page(monkeypatch, later_page):
+    empty = "<span>0</span> huurwoningen gevonden"
+    session = search_session(monkeypatch, PAGE if later_page else empty, empty)
+    listings = mvgm.fetch_listings()
+    assert len(listings) == (10 if later_page else 0)
+    assert session.get.call_count == int(later_page)
+
+
+def test_fetch_rejects_pagination_above_limit(monkeypatch):
+    session = search_session(monkeypatch, PAGE)
+    monkeypatch.setattr(mvgm, "MAX_PAGES", 2)
+    with pytest.raises(RuntimeError, match="pagination exceeds"):
+        mvgm.fetch_listings()
+    session.get.assert_not_called()

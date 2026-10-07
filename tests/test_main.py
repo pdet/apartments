@@ -1,3 +1,7 @@
+import runpy
+import sys
+from unittest.mock import MagicMock
+
 import pytest
 from dotenv import load_dotenv
 
@@ -57,3 +61,37 @@ def test_password_environment_substitutions_stay_literal(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "load_dotenv", lambda **kwargs: load_dotenv(env_path, **kwargs))
     cli.main(["--once", "--dry-run", "--db", str(tmp_path / "unused.duckdb")])
     assert cli.os.environ["MVGM_PASSWORD"] == "pass${USER}word"
+
+
+@pytest.mark.parametrize("argv, mode, exit_code, message", [
+    (["--help"], "off", 0, None),
+    (["--interval", "0"], "off", 2, "a setting is wrong, run Install again"),
+    (["--once", "--dry-run"], "on", "AUTO_APPLY=on isn't available yet; use AUTO_APPLY=shadow for now.", "AUTO_APPLY=on"),
+])
+def test_entrypoint_reports_only_failed_exits(monkeypatch, argv, mode, exit_code, message):
+    desktop = MagicMock()
+    monkeypatch.setattr("apartment_watcher.notify.notify_desktop", desktop)
+    monkeypatch.setattr("dotenv.load_dotenv", lambda **kwargs: None)
+    monkeypatch.setattr("sys.argv", ["apartment_watcher", *argv])
+    monkeypatch.setenv("AUTO_APPLY", mode)
+    monkeypatch.delitem(sys.modules, "apartment_watcher.__main__")
+    with pytest.raises(SystemExit) as exc:
+        runpy.run_module("apartment_watcher", run_name="__main__")
+    assert exc.value.code == exit_code
+    if message is None:
+        desktop.assert_not_called()
+    else:
+        desktop.assert_called_once()
+        assert message in desktop.call_args.args[0]
+
+
+def test_entrypoint_reports_and_preserves_unexpected_error(monkeypatch):
+    desktop = MagicMock()
+    monkeypatch.setattr("apartment_watcher.notify.notify_desktop", desktop)
+    monkeypatch.setattr("dotenv.load_dotenv", lambda **kwargs: None)
+    monkeypatch.setattr("sys.argv", ["apartment_watcher", "--once", "--dry-run"])
+    monkeypatch.setattr("apartment_watcher.store.SeenStore", MagicMock(side_effect=OSError("database unavailable")))
+    monkeypatch.delitem(sys.modules, "apartment_watcher.__main__")
+    with pytest.raises(OSError, match="database unavailable"):
+        runpy.run_module("apartment_watcher", run_name="__main__")
+    desktop.assert_called_once_with("Apartment watcher stopped: database unavailable")

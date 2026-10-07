@@ -27,7 +27,7 @@ class Listing:
     @property
     def rent_eur(self) -> Decimal | None:
         """Monthly rent in euros, preserving cents in Dutch prices."""
-        match = re.search(r"€\s*(\d[\d.]*(?:,\d{2})?)", self.price or "")
+        match = re.search(r"€\s*((?:\d{1,3}(?:\.\d{3})+|\d+)(?:,\d{2})?)(?:,-)?(?![\d.,]|\s+\d)", self.price or "")
         return Decimal(match.group(1).replace(".", "").replace(",", ".")) if match else None
 
 
