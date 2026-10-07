@@ -1,6 +1,8 @@
 import argparse
 import logging
+import math
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -16,7 +18,7 @@ log = logging.getLogger("apartment_watcher")
 
 
 def main(argv: list[str] | None = None) -> None:
-    load_dotenv()
+    load_dotenv(interpolate=False)
     parser = argparse.ArgumentParser(
         prog="apartment_watcher",
         description="Email new rental apartments in Amsterdam listed by Vestim and MVGM.",
@@ -33,16 +35,21 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--interval",
         type=float,
-        default=float(os.environ.get("POLL_INTERVAL_MINUTES", 10)),
+        default=os.environ.get("POLL_INTERVAL_MINUTES") or "10",
         help="minutes between checks (default: %(default)s)",
     )
     parser.add_argument("--db", default="data/apartments.duckdb", help="DuckDB file (default: %(default)s)")
     args = parser.parse_args(argv)
+    if not math.isfinite(args.interval) or args.interval <= 0:
+        parser.error("--interval / POLL_INTERVAL_MINUTES must be a positive, finite number")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     applicant = MvgmApplicant(os.environ.get("MVGM_EMAIL", ""), os.environ.get("MVGM_PASSWORD", ""))
     if args.check_login:
-        applicant.login()
+        try:
+            applicant.login()
+        finally:
+            applicant.close()
         log.info("MVGM login OK")
         return
     if args.test_email:
@@ -56,18 +63,26 @@ def main(argv: list[str] | None = None) -> None:
     if mode == ON:
         raise SystemExit("AUTO_APPLY=on isn't available yet; use AUTO_APPLY=shadow for now.")
 
-    notifier = None if args.dry_run else EmailNotifier.from_env()
-    store = SeenStore(args.db)
-    watcher = Watcher(
-        store,
-        notifier,
-        dry_run=args.dry_run,
-        applicants={} if mode == OFF else {mvgm.SOURCE: applicant},
-        criteria=Criteria.from_env(),
-        apply_mode=mode,
-        max_applications_per_day=int(os.environ.get("MAX_APPLICATIONS_PER_DAY") or 5),
-    )
     try:
+        criteria = Criteria.from_env()
+        daily_limit = int(os.environ.get("MAX_APPLICATIONS_PER_DAY") or 5)
+        if daily_limit < 1:
+            raise ValueError("MAX_APPLICATIONS_PER_DAY must be at least 1")
+    except ValueError as exc:
+        parser.error(str(exc))
+    notifier = None if args.dry_run else EmailNotifier.from_env()
+    db = args.db if not args.dry_run or Path(args.db).is_file() else ":memory:"
+    store = SeenStore(db, read_only=args.dry_run and db != ":memory:")
+    try:
+        watcher = Watcher(
+            store,
+            notifier,
+            dry_run=args.dry_run,
+            applicants={} if mode == OFF else {mvgm.SOURCE: applicant},
+            criteria=criteria,
+            apply_mode=mode,
+            max_applications_per_day=daily_limit,
+        )
         if args.once or args.apply_existing:
             watcher.run_once(apply_existing=args.apply_existing)
         else:
@@ -75,6 +90,7 @@ def main(argv: list[str] | None = None) -> None:
     except KeyboardInterrupt:
         log.info("Stopped")
     finally:
+        applicant.close()
         store.close()
 
 

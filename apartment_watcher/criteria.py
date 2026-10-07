@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from decimal import Decimal
 
 from .listing import Listing
 
@@ -19,13 +20,22 @@ class Criteria:
     gross_yearly_income: int | None = None
     household_size: int = 1
 
+    def __post_init__(self) -> None:
+        for name in ("max_rent", "min_size_m2", "gross_yearly_income"):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name.upper()} must not be negative")
+        if self.household_size < 1:
+            raise ValueError("HOUSEHOLD_SIZE must be at least 1")
+
     @classmethod
     def from_env(cls) -> Criteria:
+        household_size = _env_int("HOUSEHOLD_SIZE")
         return cls(
             max_rent=_env_int("MAX_RENT"),
             min_size_m2=_env_int("MIN_SIZE_M2"),
             gross_yearly_income=_env_int("GROSS_YEARLY_INCOME"),
-            household_size=_env_int("HOUSEHOLD_SIZE") or 1,
+            household_size=1 if household_size is None else household_size,
         )
 
     @property
@@ -55,10 +65,14 @@ class Criteria:
         return reasons
 
 
-def _eur(amount: int) -> str:
-    return f"€ {amount:,}".replace(",", ".")
+def _eur(amount: int | Decimal) -> str:
+    precision = 0 if amount == int(amount) else 2
+    return f"€ {amount:,.{precision}f}".translate(str.maketrans(",.", ".,"))
 
 
 def _env_int(name: str) -> int | None:
     value = os.environ.get(name, "").strip()
-    return int(value) if value else None
+    try:
+        return int(value) if value else None
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a whole number") from exc

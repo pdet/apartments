@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import random
 import time
 import traceback
@@ -60,7 +61,7 @@ class Watcher:
         self,
         store: SeenStore,
         notifier: Notifier | None,
-        sources: list[Source] = SOURCES,
+        sources: list[Source] | None = None,
         dry_run: bool = False,
         applicants: dict[str, Applicant] | None = None,
         criteria: Criteria | None = None,
@@ -71,13 +72,14 @@ class Watcher:
             raise ValueError("a notifier is required unless dry_run is set")
         self.store = store
         self.notifier = notifier
-        self.sources = sources
+        self.sources = SOURCES if sources is None else sources
         self.dry_run = dry_run
         self.applicants = applicants or {}
         self.criteria = criteria or Criteria()
         self.apply_mode = apply_mode
         self.max_applications_per_day = max_applications_per_day
         self.failures: dict[str, int] = {}
+        self._alerted: set[str] = set()
         self._logged_in: dict[str, bool] = {}  # login result per source, for the current check
 
     def run_once(self, apply_existing: bool = False) -> None:
@@ -97,6 +99,7 @@ class Watcher:
             self._record_scrape_failure(source, "The scraper returned no listings at all; the site layout may have changed.")
             return
         self.failures[source.name] = 0
+        self._alerted.discard(source.name)
 
         matches = [listing for listing in listings if is_match(listing)]
         log.info("%s: %d listings scraped, %d for rent in %s", source.name, len(listings), len(matches), TARGET_CITY)
@@ -136,7 +139,7 @@ class Watcher:
         log.info("%s: emailed new listing %s (%s)", listing.source, listing.display_name, listing.url)
 
     def _apply_existing(self, listing: Listing) -> None:
-        # Pedro already got an email for this listing, so only email when something was submitted (or failed).
+        # Existing listings only need another email when an application was submitted or failed.
         application = self._maybe_apply(listing)
         if application is None:
             return
@@ -190,6 +193,7 @@ class Watcher:
             else:
                 self._logged_in[source] = True
                 self.failures[key] = 0
+                self._alerted.discard(key)
         return self._logged_in[source]
 
     def _record_scrape_failure(self, source: Source, reason: str) -> None:
@@ -203,15 +207,19 @@ class Watcher:
     def _record_failure(self, key: str, subject: str, problem: str, reason: str) -> None:
         count = self.failures[key] = self.failures.get(key, 0) + 1
         log.warning("%s: failed (%d in a row)", key, count)
-        if count != ALERT_AFTER_FAILURES or self.dry_run:
+        if count < ALERT_AFTER_FAILURES or key in self._alerted or self.dry_run:
             return
         try:
             self.notifier.send_alert(subject, f"{problem}\n\nThis failed {count} times in a row. Last error:\n{reason}")
         except Exception:
             log.exception("Failed to send the alert email")
+        else:
+            self._alerted.add(key)
 
 
 def run_forever(watcher: Watcher, interval_minutes: float) -> None:
+    if not math.isfinite(interval_minutes) or interval_minutes <= 0:
+        raise ValueError("The polling interval must be a positive, finite number of minutes")
     while True:
         try:
             watcher.run_once()

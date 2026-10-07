@@ -5,7 +5,6 @@ from __future__ import annotations
 import getpass
 import os
 import plistlib
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -20,13 +19,20 @@ LABEL = "nl.apartment-watcher"
 PLIST = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
 
 
-def ask(question: str, current: str | None = None, secret: bool = False, required: bool = True, number: bool = False) -> str:
+def ask(
+    question: str, current: str | None = None, secret: bool = False, required: bool = True,
+    number: bool = False, minimum: int = 0,
+) -> str:
     hint = " [press Enter to keep the current one]" if secret and current else f" [{current}]" if current else ""
     while True:
-        answer = (getpass.getpass if secret else input)(f"{question}{hint}: ").strip()
+        answer = (getpass.getpass if secret else input)(f"{question}{hint}: ")
+        if not secret:
+            answer = answer.strip()
+        if not required and answer == "-":
+            return ""
         answer = answer or current or ""
-        if number and answer and not answer.isdigit():
-            print("  Please type a whole number, without dots or euro signs.")
+        if number and answer and (not answer.isascii() or not answer.isdecimal() or int(answer) < minimum):
+            print(f"  Please type a whole number of at least {minimum}, without dots or euro signs.")
         elif required and not answer:
             print("  This one is needed.")
         else:
@@ -43,21 +49,23 @@ def write_env(values: dict[str, str]) -> None:
     for key, value in values.items():
         escaped = value.replace("\\", "\\\\").replace('"', '\\"')
         lines.append(f'{key}="{escaped}"')
-    ENV_FILE.write_text("\n".join(lines) + "\n")
-    ENV_FILE.chmod(0o600)
+    with ENV_FILE.open("w", encoding="utf-8") as env_file:
+        os.fchmod(env_file.fileno(), 0o600)
+        env_file.write("\n".join(lines) + "\n")
 
 
 def stop_service() -> None:
-    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"], capture_output=True)
+    target = f"gui/{os.getuid()}/{LABEL}"
+    if subprocess.run(["launchctl", "print", target], capture_output=True).returncode == 0:
+        subprocess.run(["launchctl", "bootout", target], check=True, capture_output=True)
 
 
 def start_service() -> None:
-    uv = os.environ.get("UV") or shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
     log_file = str(PROJECT_DIR / "watcher.log")
     plist = {
         "Label": LABEL,
         # caffeinate keeps the Mac from falling asleep while the watcher runs.
-        "ProgramArguments": ["/usr/bin/caffeinate", "-i", uv, "run", "--project", str(PROJECT_DIR), "python", "-m", "apartment_watcher"],
+        "ProgramArguments": ["/usr/bin/caffeinate", "-i", str(PROJECT_DIR / ".venv" / "bin" / "python"), "-u", "-m", "apartment_watcher"],
         "WorkingDirectory": str(PROJECT_DIR),
         "RunAtLoad": True,
         "KeepAlive": True,
@@ -70,9 +78,8 @@ def start_service() -> None:
 
 
 def main() -> None:
-    current = {k: v for k, v in dotenv_values(ENV_FILE).items() if v} if ENV_FILE.exists() else {}
-    env: dict[str, str] = {}
-    stop_service()
+    current = {k: v for k, v in dotenv_values(ENV_FILE, interpolate=False).items() if v is not None}
+    env = current.copy()
 
     print("\nApartment watcher setup\n=======================\n")
     print("1) Email. The watcher sends emails from your Gmail account.")
@@ -91,12 +98,13 @@ def main() -> None:
             current.pop("GMAIL_APP_PASSWORD", None)
 
     print("2) Auto-apply (optional). The watcher can check which MVGM apartments fit you.")
-    if yes("   Set up auto-apply for MVGM?", current.get("AUTO_APPLY", "off") != "off"):
+    if yes("   Set up auto-apply for MVGM?", current.get("AUTO_APPLY", "off").strip().lower() not in ("", "off")):
         while True:
             env["MVGM_EMAIL"] = ask("   Your ikwilhuren.nu email", current.get("MVGM_EMAIL"))
             env["MVGM_PASSWORD"] = ask("   Your ikwilhuren.nu password", current.get("MVGM_PASSWORD"), secret=True)
+            applicant = MvgmApplicant(env["MVGM_EMAIL"], env["MVGM_PASSWORD"])
             try:
-                MvgmApplicant(env["MVGM_EMAIL"], env["MVGM_PASSWORD"]).login()
+                applicant.login()
                 print("  ✓ Logged in to ikwilhuren.nu\n")
                 break
             except Exception as exc:
@@ -104,17 +112,20 @@ def main() -> None:
                 current.pop("MVGM_PASSWORD", None)
                 if not yes("   Try again?", True):
                     break
-        print("   Leave a question empty for 'no limit'.")
+            finally:
+                applicant.close()
+        print("   Leave a new limit empty for 'no limit'; type '-' to remove a saved limit.")
         env["MAX_RENT"] = ask("   Maximum rent per month in euros", current.get("MAX_RENT"), required=False, number=True)
         env["MIN_SIZE_M2"] = ask("   Minimum size in m²", current.get("MIN_SIZE_M2"), required=False, number=True)
         env["GROSS_YEARLY_INCOME"] = ask(
             "   Gross yearly income in euros (household total)", current.get("GROSS_YEARLY_INCOME"), required=False, number=True
         )
-        env["HOUSEHOLD_SIZE"] = ask("   How many people will live there", current.get("HOUSEHOLD_SIZE", "1"), number=True)
-        env["AUTO_APPLY"] = current.get("AUTO_APPLY") if current.get("AUTO_APPLY", "off") != "off" else "shadow"
+        env["HOUSEHOLD_SIZE"] = ask("   How many people will live there", current.get("HOUSEHOLD_SIZE") or "1", number=True, minimum=1)
+        env["AUTO_APPLY"] = "shadow"
     else:
         env["AUTO_APPLY"] = "off"
-    env["POLL_INTERVAL_MINUTES"] = current.get("POLL_INTERVAL_MINUTES", "10")
+    env["POLL_INTERVAL_MINUTES"] = current.get("POLL_INTERVAL_MINUTES") or "10"
+    stop_service()
     write_env(env)
 
     print("\n3) Starting the watcher in the background (it also starts when you log in)...")

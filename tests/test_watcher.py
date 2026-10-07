@@ -166,6 +166,23 @@ def test_empty_results_count_as_failure(setup):
     assert notifier.alerts == ["Test scraper may be broken"]
 
 
+def test_failed_alert_is_retried_until_delivered(setup, monkeypatch):
+    watcher, notifier, source = setup
+    source.error = RuntimeError("layout changed")
+    send_alert = notifier.send_alert
+
+    def fail_alert(*args):
+        raise OSError("SMTP down")
+
+    monkeypatch.setattr(notifier, "send_alert", fail_alert)
+    for _ in range(ALERT_AFTER_FAILURES + 1):
+        watcher.run_once()
+    monkeypatch.setattr(notifier, "send_alert", send_alert)
+    watcher.run_once()
+    watcher.run_once()
+    assert notifier.alerts == ["Test scraper may be broken"]
+
+
 class FakeApplicant:
     def __init__(self):
         self.applied = []

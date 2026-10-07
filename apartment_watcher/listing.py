@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from decimal import Decimal
 
 
 @dataclass(frozen=True)
@@ -24,10 +25,10 @@ class Listing:
         return f"{self.title}, {self.city}"
 
     @property
-    def rent_eur(self) -> int | None:
-        """Monthly rent in whole euros: "€ 1.207,- /mnd" -> 1207, "€ 1.583,00 / maand" -> 1583."""
-        match = re.search(r"€\s*(\d[\d.]*)", self.price or "")
-        return int(match.group(1).replace(".", "")) if match else None
+    def rent_eur(self) -> Decimal | None:
+        """Monthly rent in euros, preserving cents in Dutch prices."""
+        match = re.search(r"€\s*(\d[\d.]*(?:,\d{2})?)", self.price or "")
+        return Decimal(match.group(1).replace(".", "").replace(",", ".")) if match else None
 
 
 def first_int(text: str | None) -> int | None:

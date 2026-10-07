@@ -11,10 +11,12 @@ from .listing import Listing
 class SeenStore:
     """DuckDB record of the listings and applications we've already handled, per source."""
 
-    def __init__(self, path: str | Path) -> None:
-        if str(path) != ":memory:":
+    def __init__(self, path: str | Path, *, read_only: bool = False) -> None:
+        if not read_only and str(path) != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = duckdb.connect(str(path))
+        self._conn = duckdb.connect(str(path), read_only=read_only)
+        if read_only:
+            return
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS seen (
@@ -68,7 +70,8 @@ class SeenStore:
 
     def record_application(self, listing: Listing, result: ApplyResult, mode: str) -> None:
         self._conn.execute(
-            "INSERT OR REPLACE INTO applications (source, listing_id, url, status, mode, detail) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO applications (source, listing_id, url, status, mode, detail, attempted_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, now())",
             [listing.source, listing.listing_id, listing.url, result.status, mode, result.detail],
         )
 

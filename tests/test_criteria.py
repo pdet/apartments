@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 import pytest
 
 from apartment_watcher.criteria import Criteria
@@ -39,3 +41,20 @@ def test_income_rule_depends_on_household_size():
     assert Criteria(gross_yearly_income=80_000, household_size=2).failures(make_listing()) == [
         "income € 80.000 < 60 × € 1.500 = € 90.000"
     ]
+
+
+def test_rent_cents_affect_both_budget_and_income():
+    listing = make_listing(price="€ 1.500,50 / maand")
+    assert listing.rent_eur == Decimal("1500.50")
+    assert Criteria(max_rent=1500, gross_yearly_income=67500).failures(listing) == [
+        "rent € 1.500,50 > max € 1.500",
+        "income € 67.500 < 45 × € 1.500,50 = € 67.522,50",
+    ]
+    assert Criteria(max_rent=1501, gross_yearly_income=67523).failures(listing) == []
+
+
+@pytest.mark.parametrize("name,value", [("HOUSEHOLD_SIZE", "0"), ("HOUSEHOLD_SIZE", "-1"), ("MAX_RENT", "-2"), ("MIN_SIZE_M2", "bad")])
+def test_invalid_criteria_configuration(monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=name):
+        Criteria.from_env()

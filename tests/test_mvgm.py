@@ -1,8 +1,10 @@
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
-from apartment_watcher import mvgm
+from apartment_watcher import mvgm, mvgm_apply
+from apartment_watcher.applying import LoginError
 
 FIXTURES = Path(__file__).parent / "fixtures"
 PAGE = (FIXTURES / "mvgm_amsterdam_page1.html").read_text()
@@ -54,3 +56,87 @@ def test_parse_csrf_token():
 def test_search_applied():
     assert mvgm.search_applied(PAGE)
     assert not mvgm.search_applied((FIXTURES / "mvgm_unfiltered_page1.html").read_text())
+
+
+def response(text="", data=None):
+    result = MagicMock(text=text)
+    result.json.return_value = data
+    return result
+
+
+def test_open_session_refreshes_csrf_after_ajax_cookie_creation(monkeypatch):
+    session = MagicMock()
+    session.get.side_effect = [response('<input name="_token" value="initial">'), response('<input name="_token" value="persisted">')]
+    session.post.return_value = response(data={"results": [{"id": "city", "text": mvgm.CITY_LABEL}]})
+    monkeypatch.setattr(mvgm, "new_session", lambda: session)
+    opened, token = mvgm.open_session()
+    assert opened is session and token == "persisted"
+    assert session.post.call_args.kwargs["headers"]["X-CSRF-TOKEN"] == "initial"
+    assert [call[0] for call in session.method_calls] == ["get", "post", "get"]
+    session.close.assert_not_called()
+
+
+def test_open_session_closes_on_failure(monkeypatch):
+    session = MagicMock()
+    session.get.return_value = response('<input name="_token" value="">')
+    monkeypatch.setattr(mvgm, "new_session", lambda: session)
+    with pytest.raises(RuntimeError, match="CSRF"):
+        mvgm.open_session()
+    session.close.assert_called_once()
+
+
+def test_lost_search_filter_on_later_page_is_rejected(monkeypatch):
+    session = MagicMock()
+    session.post.side_effect = [
+        response(data={"results": [{"id": "city", "text": mvgm.CITY_LABEL}]}),
+        response(data={"lat": 52, "lng": 4}), response(PAGE),
+    ]
+    session.get.return_value = response((FIXTURES / "mvgm_unfiltered_page1.html").read_text())
+    monkeypatch.setattr(mvgm, "open_session", lambda: (session, "token"))
+    monkeypatch.setattr(mvgm.time, "sleep", lambda seconds: None)
+    with pytest.raises(RuntimeError, match="filter was lost"):
+        mvgm.fetch_listings()
+    assert session.post.call_args.kwargs["data"]["selAfstand"] == 20
+    session.__exit__.assert_called_once()
+
+
+@pytest.mark.parametrize("html", ["", "{}", "<h1>Try again</h1>", PAGE, '<nav id="navbar-account"><a href="https://ikwilhuren.nu/login?next=/aanbod/">Login</a></nav>'])
+def test_anonymous_or_unexpected_html_is_not_a_verified_login(html):
+    assert not mvgm_apply.is_logged_in(html)
+
+
+def test_login_uses_form_token_and_checks_authenticated_search_page(monkeypatch):
+    session = MagicMock()
+    session.get.side_effect = [
+        response('<input name="_token" value="login-token">'),
+        response('<nav id="navbar-account"><a href="/">Account</a></nav>'),
+    ]
+    session.post.return_value = response("{}")
+    monkeypatch.setattr(mvgm, "open_session", lambda: (session, "search-token"))
+    applicant = mvgm_apply.MvgmApplicant("account@example.com", "password")
+    applicant.login()
+    assert session.post.call_args.kwargs["data"]["_token"] == "login-token"
+    assert session.get.call_args.args == (mvgm.SEARCH_URL,)
+    assert applicant.session is session
+    applicant.close()
+    session.close.assert_called_once()
+
+
+def test_failed_relogin_discards_old_session(monkeypatch):
+    old_session, session = MagicMock(), MagicMock()
+    session.get.side_effect = [response('<input name="_token" value="token">'), response(PAGE)]
+    session.post.return_value = response()
+    monkeypatch.setattr(mvgm, "open_session", lambda: (session, "token"))
+    applicant = mvgm_apply.MvgmApplicant("account@example.com", "password")
+    applicant.session = old_session
+    with pytest.raises(LoginError):
+        applicant.login()
+    assert applicant.session is None
+    old_session.close.assert_called_once()
+    session.close.assert_called_once()
+
+
+def test_live_apply_stays_unimplemented():
+    applicant = mvgm_apply.MvgmApplicant("account@example.com", "password")
+    with pytest.raises(NotImplementedError):
+        applicant.apply(None)

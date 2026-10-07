@@ -1,12 +1,4 @@
-"""Scraper for MVGM's rental portal (https://ikwilhuren.nu).
-
-The search filter lives in the server-side session: we look up Amsterdam through the
-site's address autocomplete, POST the search form once, and then page through
-/aanbod/?page=N with the same session cookie.
-
-The session cookie is only created by the first AJAX call, so the CSRF token on the very
-first page load belongs to a session that is never persisted; open_session() handles that.
-"""
+"""Scrape MVGM's rental portal using its session-based Amsterdam search."""
 
 from __future__ import annotations
 
@@ -26,8 +18,7 @@ BASE_URL = "https://ikwilhuren.nu"
 SEARCH_URL = f"{BASE_URL}/aanbod/"
 CITY_QUERY = "Amsterdam"
 CITY_LABEL = "Amsterdam, Amsterdam, Noord-Holland"  # the woonplaats, not e.g. Nieuw-Amsterdam
-# The search is a radius around the city centre. Parts of Amsterdam (Zuidoost, Nieuw-West,
-# IJburg) are 8-13 km out, so 5 km misses listings. The watcher filters on city afterwards.
+# A 20 km radius includes Amsterdam's outer districts; the watcher filters by city afterwards.
 SEARCH_RADIUS_KM = 20
 MAX_PAGES = 100
 
@@ -64,7 +55,7 @@ def parse_page(html: str) -> tuple[list[Listing], int]:
                 city=parse_city(_text(location)),
                 status=_text(status_dot.parent) if status_dot else "",
                 price=next((d for d in details if "€" in d), None),
-                size_m2=first_int(next((d for d in details if "m2" in d.replace(" ", "")), None)),
+                size_m2=first_int(next((d for d in details if "m2" in d.replace(" ", "").replace("²", "2")), None)),
                 bedrooms=first_int(next((d for d in details if "slaapkamer" in d.lower()), None)),
                 available=_text(availability) or None,
             )
@@ -84,21 +75,25 @@ def search_applied(html: str) -> bool:
 
 def parse_csrf_token(html: str) -> str:
     token = BeautifulSoup(html, "html.parser").select_one('input[name="_token"][value]')
-    if token is None:
-        raise RuntimeError("MVGM: CSRF token not found on /aanbod/")
+    if token is None or not token["value"].strip():
+        raise RuntimeError("MVGM: CSRF token not found on the page")
     return token["value"]
 
 
 def open_session() -> tuple[requests.Session, str]:
     """Return a session whose cookie is persisted by the site, plus its CSRF token."""
     session = new_session()
-    response = session.get(SEARCH_URL, timeout=TIMEOUT)
-    response.raise_for_status()
-    # The cookie is only created by an AJAX call; the address lookup is a cheap one.
-    _lookup_location(session, parse_csrf_token(response.text))
-    response = session.get(SEARCH_URL, timeout=TIMEOUT)
-    response.raise_for_status()
-    return session, parse_csrf_token(response.text)
+    try:
+        response = session.get(SEARCH_URL, timeout=TIMEOUT)
+        response.raise_for_status()
+        # The cookie is only created by an AJAX call; the address lookup is a cheap one.
+        _lookup_location(session, parse_csrf_token(response.text))
+        response = session.get(SEARCH_URL, timeout=TIMEOUT)
+        response.raise_for_status()
+        return session, parse_csrf_token(response.text)
+    except BaseException:
+        session.close()
+        raise
 
 
 def _lookup_location(session: requests.Session, token: str) -> str:
@@ -122,45 +117,48 @@ def _ajax_headers(token: str) -> dict[str, str]:
 
 def fetch_listings() -> list[Listing]:
     session, token = open_session()
-    location_id = _lookup_location(session, token)
-    response = session.post(
-        f"{BASE_URL}/aanbod/geo/adres/",
-        data={"locatieid": location_id},
-        headers=_ajax_headers(token),
-        timeout=TIMEOUT,
-    )
-    response.raise_for_status()
-
-    response = session.post(
-        SEARCH_URL,
-        data={
-            "_token": token,
-            "postrequest": "doeZoek",
-            "objSearch": json.dumps(response.json()),
-            "selAdres": location_id,
-            "selAfstand": SEARCH_RADIUS_KM,
-        },
-        timeout=TIMEOUT,
-    )
-    response.raise_for_status()
-    listings, last_page = parse_page(response.text)
-    if listings and not search_applied(response.text):
-        raise RuntimeError("MVGM: the Amsterdam search filter was not applied (got the unfiltered list)")
-
-    for page in range(2, min(last_page, MAX_PAGES) + 1):
-        time.sleep(PAGE_DELAY)
-        response = session.get(SEARCH_URL, params={"page": page}, timeout=TIMEOUT)
+    with session:
+        location_id = _lookup_location(session, token)
+        response = session.post(
+            f"{BASE_URL}/aanbod/geo/adres/",
+            data={"locatieid": location_id},
+            headers=_ajax_headers(token),
+            timeout=TIMEOUT,
+        )
         response.raise_for_status()
-        page_listings, _ = parse_page(response.text)
-        if not page_listings:
-            break
-        listings.extend(page_listings)
 
-    # Listings can shift between pages while we paginate; keep the first occurrence.
-    unique: dict[str, Listing] = {}
-    for listing in listings:
-        unique.setdefault(listing.listing_id, listing)
-    return list(unique.values())
+        response = session.post(
+            SEARCH_URL,
+            data={
+                "_token": token,
+                "postrequest": "doeZoek",
+                "objSearch": json.dumps(response.json()),
+                "selAdres": location_id,
+                "selAfstand": SEARCH_RADIUS_KM,
+            },
+            timeout=TIMEOUT,
+        )
+        response.raise_for_status()
+        listings, last_page = parse_page(response.text)
+        if listings and not search_applied(response.text):
+            raise RuntimeError("MVGM: the Amsterdam search filter was not applied (got the unfiltered list)")
+
+        for page in range(2, min(last_page, MAX_PAGES) + 1):
+            time.sleep(PAGE_DELAY)
+            response = session.get(SEARCH_URL, params={"page": page}, timeout=TIMEOUT)
+            response.raise_for_status()
+            page_listings, _ = parse_page(response.text)
+            if not page_listings:
+                break
+            if not search_applied(response.text):
+                raise RuntimeError("MVGM: the Amsterdam search filter was lost during pagination")
+            listings.extend(page_listings)
+
+        # Listings can shift between pages while we paginate; keep the first occurrence.
+        unique: dict[str, Listing] = {}
+        for listing in listings:
+            unique.setdefault(listing.listing_id, listing)
+        return list(unique.values())
 
 
 def _text(tag: Tag | None) -> str:

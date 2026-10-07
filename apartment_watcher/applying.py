@@ -7,7 +7,6 @@ from typing import Protocol
 
 from .listing import Listing
 
-# AUTO_APPLY modes
 OFF = "off"
 SHADOW = "shadow"  # decide and report, but never submit anything
 ON = "on"

@@ -12,8 +12,7 @@ from .session import PAGE_DELAY, TIMEOUT, new_session
 
 SOURCE = "Vestim"
 BASE_URL = "https://www.vestim.nl"
-# Listings of VestiM's Amsterdam regional office that are still for rent. This also
-# includes nearby towns (e.g. Amstelveen); the watcher filters on city afterwards.
+# The Amsterdam office includes nearby towns; the watcher filters by city afterwards.
 SEARCH_URL = f"{BASE_URL}/woningen?status=for_rent&kantoor=amsterdam"
 MAX_PAGES = 20
 
@@ -49,19 +48,19 @@ def parse_page(html: str) -> tuple[list[Listing], str | None]:
 
 
 def fetch_listings() -> list[Listing]:
-    session = new_session()
-    listings: list[Listing] = []
-    url: str | None = SEARCH_URL
-    visited: set[str] = set()
-    while url and url not in visited and len(visited) < MAX_PAGES:
-        if visited:
-            time.sleep(PAGE_DELAY)
-        visited.add(url)
-        response = session.get(url, timeout=TIMEOUT)
-        response.raise_for_status()
-        page_listings, url = parse_page(response.text)
-        listings.extend(page_listings)
-    return listings
+    with new_session() as session:
+        listings: list[Listing] = []
+        url: str | None = SEARCH_URL
+        visited: set[str] = set()
+        while url and url not in visited and len(visited) < MAX_PAGES:
+            if visited:
+                time.sleep(PAGE_DELAY)
+            visited.add(url)
+            response = session.get(url, timeout=TIMEOUT)
+            response.raise_for_status()
+            page_listings, url = parse_page(response.text)
+            listings.extend(page_listings)
+        return listings
 
 
 def _text(tag: Tag | None) -> str:

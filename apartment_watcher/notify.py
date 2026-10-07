@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import os
 import smtplib
+import ssl
 from email.message import EmailMessage
 
 from .applying import ALREADY_APPLIED, APPLIED, CAP_REACHED, FAILED, SKIPPED, WOULD_APPLY, ApplyResult
@@ -47,13 +48,13 @@ class EmailNotifier:
 
     def _send(self, subject: str, text: str, html_body: str | None = None) -> None:
         message = EmailMessage()
-        message["Subject"] = subject
+        message["Subject"] = " ".join(subject.splitlines())
         message["From"] = self.sender
         message["To"] = self.recipient
         message.set_content(text)
         if html_body:
             message.add_alternative(html_body, subtype="html")
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30, context=ssl.create_default_context()) as smtp:
             smtp.login(self.sender, self.app_password)
             smtp.send_message(message)
 
@@ -77,7 +78,7 @@ def listing_bodies(listing: Listing, application: ApplyResult | None = None) -> 
         ("Auto-apply", auto_apply),
         ("Price", listing.price),
         ("Size", f"{listing.size_m2} m²" if listing.size_m2 else None),
-        ("Bedrooms", str(listing.bedrooms) if listing.bedrooms else None),
+        ("Bedrooms", str(listing.bedrooms) if listing.bedrooms is not None else None),
         ("Available", listing.available),
         ("Status", listing.status),
     ]
