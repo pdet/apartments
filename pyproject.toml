@@ -1,0 +1,17 @@
+[project]
+name = "apartment-watcher"
+version = "0.1.0"
+description = "Emails new Amsterdam rental listings from Vestim and MVGM"
+requires-python = ">=3.11"
+dependencies = [
+    "beautifulsoup4>=4.12",
+    "python-dotenv>=1.0",
+    "requests>=2.31",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

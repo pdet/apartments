@@ -1,0 +1,68 @@
+"""Scraper for VestiM Verhuurmakelaars (https://www.vestim.nl)."""
+
+from __future__ import annotations
+
+import time
+from urllib.parse import urljoin
+
+from bs4 import BeautifulSoup, Tag
+
+from .listing import Listing, first_int
+from .session import PAGE_DELAY, TIMEOUT, new_session
+
+SOURCE = "Vestim"
+BASE_URL = "https://www.vestim.nl"
+# Listings of VestiM's Amsterdam regional office that are still for rent. This also
+# includes nearby towns (e.g. Amstelveen); the watcher filters on city afterwards.
+SEARCH_URL = f"{BASE_URL}/woningen?status=for_rent&kantoor=amsterdam"
+MAX_PAGES = 20
+
+
+def parse_page(html: str) -> tuple[list[Listing], str | None]:
+    """Return the listings on a /woningen page and the URL of the next page, if any."""
+    soup = BeautifulSoup(html, "html.parser")
+    listings = []
+    for card in soup.select("div.vm-listing-block a.vm-listing-block2[href]"):
+        url = urljoin(BASE_URL, card["href"])
+        # Titles look like "Amsterdam, Jacob van Lennepkade".
+        title = _text(card.select_one(".vm-listing-title"))
+        city = title.partition(",")[0].strip()
+        # The label is either an availability date ("Per 12 Oktober 2026") or a tagline ("Ruim appartement").
+        label = _text(card.select_one(".vm-listing-label"))
+        listings.append(
+            Listing(
+                source=SOURCE,
+                listing_id=url.rstrip("/").rsplit("/", 1)[-1],
+                url=url,
+                title=title,
+                city=city,
+                status=_text(card.select_one(".vm-listing-status")),
+                price=_text(card.select_one(".vm-listing-price")) or None,
+                size_m2=first_int(_text(card.select_one('li[title^="Oppervlakte"]'))),
+                bedrooms=first_int(_text(card.select_one('li[title^="Slaapkamer"]'))),
+                available=label if label.startswith("Per ") else None,
+            )
+        )
+    next_link = soup.select_one('a.page-link[aria-label="Next"][href]')
+    next_url = urljoin(BASE_URL, next_link["href"]) if next_link else None
+    return listings, next_url
+
+
+def fetch_listings() -> list[Listing]:
+    session = new_session()
+    listings: list[Listing] = []
+    url: str | None = SEARCH_URL
+    visited: set[str] = set()
+    while url and url not in visited and len(visited) < MAX_PAGES:
+        if visited:
+            time.sleep(PAGE_DELAY)
+        visited.add(url)
+        response = session.get(url, timeout=TIMEOUT)
+        response.raise_for_status()
+        page_listings, url = parse_page(response.text)
+        listings.extend(page_listings)
+    return listings
+
+
+def _text(tag: Tag | None) -> str:
+    return tag.get_text(" ", strip=True) if tag else ""
